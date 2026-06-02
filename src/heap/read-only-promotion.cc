@@ -4,6 +4,7 @@
 
 #include "src/heap/read-only-promotion.h"
 
+#include <algorithm>
 #include <unordered_set>
 
 #include "src/codegen/external-reference-encoder.h"
@@ -19,6 +20,7 @@
 #include "src/sandbox/external-pointer-table.h"
 #include "src/sandbox/trusted-pointer-scope.h"
 #include "src/sandbox/trusted-pointer-table.h"
+#include "src/snapshot/read-only-serializer-deserializer.h"
 #include "src/utils/ostreams.h"
 
 namespace v8 {
@@ -871,6 +873,19 @@ void ReadOnlyPromotion::Promote(Isolate* isolate,
   // promoted to RO space.
   std::vector<Tagged<HeapObject>> promotees =
       Committee::DeterminePromotees(isolate, no_gc, safepoint_scope);
+  // Partition promotees so that objects needing post-processing come first.
+  // Grouping them together lets the serializer emit fewer/smaller
+  // post-process ranges, minimizing the heap scanned during deserialization.
+  auto is_fixup = [](Tagged<HeapObject> o) {
+#define V(TYPE)      \
+  if (Is##TYPE(o)) { \
+    return true;     \
+  }
+    RO_POST_PROCESS_TYPE_LIST(V)
+#undef V
+    return false;
+  };
+  std::stable_partition(promotees.begin(), promotees.end(), is_fixup);
   // Physically copy promotee objects to RO space and track all object moves.
   HeapObjectMap moves;
   ReadOnlyPromotionImpl::CopyToReadOnlyHeap(isolate, promotees, &moves);

@@ -120,10 +120,22 @@ class SnapshotImpl : public AllStatic {
         data->raw_size - kChecksumStart);
   }
 
+  static uint32_t AlignedOffsetWithHeader(uint32_t base_offset) {
+    return RoundUp(base_offset + SnapshotData::kHeaderSize,
+                   kTargetMinimumOSPageSize) -
+           SnapshotData::kHeaderSize;
+  }
+
   // The read-only snapshot is placed first, right after the header.
+  // Padded so that the RO snapshot payload (after the SnapshotData header)
+  // starts at a page-aligned offset within the blob. Combined with
+  // alignas(kTargetMinimumOSPageSize) on the compiled-in blob_data[] array,
+  // this ensures the RO space image is at an absolute page-aligned address.
   static uint32_t ReadOnlySnapshotOffset(int num_contexts) {
-    return POINTER_SIZE_ALIGN(kFirstContextOffsetOffset +
-                              num_contexts * kInt32Size);
+    uint32_t min_offset = POINTER_SIZE_ALIGN(kFirstContextOffsetOffset +
+                                             num_contexts * kInt32Size);
+    // Round up so that min_offset + SnapshotData::kHeaderSize is page-aligned.
+    return AlignedOffsetWithHeader(min_offset);
   }
 
   static uint32_t ContextSnapshotOffsetOffset(int index) {
@@ -525,20 +537,26 @@ v8::StartupData SnapshotImpl::CreateSnapshotBlob(
 #endif
 
   uint32_t num_contexts = static_cast<uint32_t>(context_snapshots->size());
-  uint32_t read_only_offset =
+  uint32_t read_only_snapshot_offset =
       SnapshotImpl::ReadOnlySnapshotOffset(num_contexts);
-  uint32_t total_length = read_only_offset;
-  total_length += static_cast<uint32_t>(read_only_snapshot->RawData().length());
-  total_length += static_cast<uint32_t>(startup_snapshot->RawData().length());
-  total_length +=
-      static_cast<uint32_t>(shared_heap_snapshot->RawData().length());
+  uint32_t startup_snapshot_offset = AlignedOffsetWithHeader(
+      read_only_snapshot_offset + read_only_snapshot->RawData().length());
+  uint32_t shared_heap_snapshot_offset = AlignedOffsetWithHeader(
+      startup_snapshot_offset + startup_snapshot->RawData().length());
+  uint32_t context_snapshot_offset = AlignedOffsetWithHeader(
+      shared_heap_snapshot_offset + shared_heap_snapshot->RawData().length());
+
+  uint32_t total_length = context_snapshot_offset;
+
   for (const auto context_snapshot : *context_snapshots) {
     total_length += static_cast<uint32_t>(context_snapshot->RawData().length());
   }
 
+  total_length = RoundUp(total_length, kTargetMinimumOSPageSize);
+
   char* data = new char[total_length];
   // Zero out pre-payload data. Part of that is only used for padding.
-  memset(data, 0, read_only_offset);
+  memset(data, 0, read_only_snapshot_offset);
 
   SnapshotImpl::SetHeaderValue(data, SnapshotImpl::kNumberOfContextsOffset,
                                num_contexts);
@@ -552,12 +570,12 @@ v8::StartupData SnapshotImpl::CreateSnapshotBlob(
       base::Vector<char>(data + SnapshotImpl::kVersionStringOffset,
                          SnapshotImpl::kVersionStringLength));
 
-  uint32_t payload_offset = read_only_offset;
+  uint32_t payload_offset = read_only_snapshot_offset;
 
   // Read-only snapshot first, so it's close to the start of the blob.
   // When the blob is page-aligned in the executable, this allows the
   // RO space image within it to also be page-aligned.
-  DCHECK_EQ(payload_offset, read_only_offset);
+  DCHECK_EQ(payload_offset, read_only_snapshot_offset);
   uint32_t payload_length = read_only_snapshot->RawData().length();
   CopyBytes(
       data + payload_offset,
@@ -575,6 +593,15 @@ v8::StartupData SnapshotImpl::CreateSnapshotBlob(
   }
   payload_offset += payload_length;
 
+  auto zero_and_align_to_page = [&] {
+    auto aligned_offset = AlignedOffsetWithHeader(payload_offset);
+    memset(data + payload_offset, 0, aligned_offset - payload_offset);
+    payload_offset = aligned_offset;
+  };
+
+  zero_and_align_to_page();
+  DCHECK_EQ(payload_offset, startup_snapshot_offset);
+
   // Startup snapshot (isolate-specific data).
   SnapshotImpl::SetHeaderValue(data, SnapshotImpl::kStartupOffsetOffset,
                                payload_offset);
@@ -586,6 +613,9 @@ v8::StartupData SnapshotImpl::CreateSnapshotBlob(
     PrintF("%10d bytes for startup\n", payload_length);
   }
   payload_offset += payload_length;
+
+  zero_and_align_to_page();
+  DCHECK_EQ(payload_offset, shared_heap_snapshot_offset);
 
   // Shared heap.
   SnapshotImpl::SetHeaderValue(data, SnapshotImpl::kSharedHeapOffsetOffset,
@@ -600,6 +630,9 @@ v8::StartupData SnapshotImpl::CreateSnapshotBlob(
     PrintF("%10d bytes for shared heap\n", payload_length);
   }
   payload_offset += payload_length;
+
+  zero_and_align_to_page();
+  DCHECK_EQ(payload_offset, context_snapshot_offset);
 
   // Context snapshots (context-specific data).
   for (uint32_t i = 0; i < num_contexts; i++) {
@@ -619,7 +652,11 @@ v8::StartupData SnapshotImpl::CreateSnapshotBlob(
   }
   if (v8_flags.serialization_statistics) PrintF("\n");
 
+  auto padded_length = RoundUp(payload_offset, kTargetMinimumOSPageSize);
+  memset(data + payload_offset, 0, padded_length - payload_offset);
+  payload_offset = padded_length;
   DCHECK_EQ(total_length, payload_offset);
+
   v8::StartupData result = {data, static_cast<int>(total_length)};
 
   SnapshotImpl::SetHeaderValue(

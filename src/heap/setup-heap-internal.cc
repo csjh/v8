@@ -217,6 +217,72 @@ bool Heap::CreateReadOnlyHeapObjects() {
 
   CreateReadOnlyApiObjects();
 
+  // Allocate WasmNull and holes last so that the other read-only objects are
+  // dense and their positions are independent of kLargestPossibleOSPageSize.
+  // These objects have large payloads aligned to OS page boundaries (for
+  // decommitting at runtime), so they fragment the space.  Placing them at the
+  // end also ensures their static-root addresses are deterministic: they depend
+  // only on the initial read-only layout above, not on promoted objects (whose
+  // set varies between debug/release builds) that are appended later.
+  {
+    ReadOnlyRoots roots(isolate());
+
+#ifdef V8_ENABLE_WEBASSEMBLY
+#define V8_UNMAP_WASM_NULL_PAYLOAD \
+  (V8_STATIC_ROOTS_BOOL || V8_STATIC_ROOTS_GENERATION_BOOL)
+
+#if V8_UNMAP_WASM_NULL_PAYLOAD
+    {
+      static_assert(WasmNull::kSize ==
+                    WasmNull::kHeaderSize + WasmNull::kPayloadSize);
+      Tagged<HeapObject> wasm_null_obj =
+          read_only_space_
+              ->AllocateRawUnmappableAllocation(WasmNull::kHeaderSize,
+                                                WasmNull::kPayloadSize)
+              .ToObjectChecked();
+      wasm_null_obj->set_map_after_allocation(isolate(), roots.wasm_null_map(),
+                                              SKIP_WRITE_BARRIER);
+      set_wasm_null(Cast<WasmNull>(wasm_null_obj));
+    }
+#else
+    {
+      Tagged<HeapObject> wasm_null_obj;
+      CHECK(AllocateRaw(WasmNull::kSize, AllocationType::kReadOnly)
+                .To(&wasm_null_obj));
+      wasm_null_obj->set_map_after_allocation(isolate(), roots.wasm_null_map(),
+                                              SKIP_WRITE_BARRIER);
+      set_wasm_null(Cast<WasmNull>(wasm_null_obj));
+    }
+#endif  // V8_UNMAP_WASM_NULL_PAYLOAD
+#endif  // V8_ENABLE_WEBASSEMBLY
+
+    auto make_hole = [this, roots]() {
+      static_assert(sizeof(Hole) == sizeof(Hole::map_) + Hole::kPayloadSize);
+      Tagged<HeapObject> hole_obj =
+          read_only_space_
+              ->AllocateRawUnmappableAllocation(sizeof(Hole::map_),
+                                                Hole::kPayloadSize)
+              .ToObjectChecked();
+      hole_obj->set_map_after_allocation(isolate(), roots.hole_map(),
+                                         SKIP_WRITE_BARRIER);
+      return Cast<Hole>(hole_obj);
+    };
+
+    set_the_hole_value(UncheckedCast<TheHole>(make_hole()));
+    set_property_cell_hole_value(UncheckedCast<PropertyCellHole>(make_hole()));
+    set_hash_table_hole_value(UncheckedCast<HashTableHole>(make_hole()));
+    set_promise_hole_value(UncheckedCast<PromiseHole>(make_hole()));
+    set_uninitialized_value(UncheckedCast<UninitializedHole>(make_hole()));
+    set_arguments_marker(UncheckedCast<ArgumentsMarker>(make_hole()));
+    set_termination_exception(UncheckedCast<TerminationException>(make_hole()));
+    set_exception(UncheckedCast<ExceptionHole>(make_hole()));
+    set_optimized_out(UncheckedCast<OptimizedOut>(make_hole()));
+    set_stale_register(UncheckedCast<StaleRegister>(make_hole()));
+    set_self_reference_marker(UncheckedCast<SelfReferenceMarker>(make_hole()));
+    set_basic_block_counters_marker(
+        UncheckedCast<BasicBlockCountersMarker>(make_hole()));
+  }
+
 #ifdef DEBUG
   ReadOnlyRoots roots(isolate());
   for (auto pos = RootIndex::kFirstReadOnlyRoot;
@@ -1355,82 +1421,6 @@ bool Heap::CreateReadOnlyObjects() {
     }
     set_preallocated_number_string_table(*preallocated_number_string_table);
   }
-
-  // Initialize the wasm null_value.
-
-#ifdef V8_ENABLE_WEBASSEMBLY
-  // Allocate the wasm-null object. It is a regular V8 heap object contained in
-  // a V8 page.
-  // In static-roots builds, it is large enough so that its payload (other than
-  // its map word) can be mprotected on OS page granularity. We adjust the
-  // layout such that we have a filler object in the current OS page, and the
-  // wasm-null map word at the end of the current OS page. The payload then is
-  // contained on a separate OS page which can be protected.
-  // In non-static-roots builds, it is a regular object of size {kTaggedSize}
-  // and does not need padding.
-#define V8_UNMAP_WASM_NULL_PAYLOAD \
-  (V8_STATIC_ROOTS_BOOL || V8_STATIC_ROOTS_GENERATION_BOOL)
-
-#if V8_UNMAP_WASM_NULL_PAYLOAD
-  // Allocate an unmappable WasmNull.
-  {
-    static_assert(WasmNull::kSize ==
-                  WasmNull::kHeaderSize + WasmNull::kPayloadSize);
-    Tagged<HeapObject> wasm_null_obj =
-        read_only_space_
-            ->AllocateRawUnmappableAllocation(WasmNull::kHeaderSize,
-                                              WasmNull::kPayloadSize)
-            .ToObjectChecked();
-    wasm_null_obj->set_map_after_allocation(isolate(), roots.wasm_null_map(),
-                                            SKIP_WRITE_BARRIER);
-    // No need to initialize the payload since it's either empty or unmapped.
-    set_wasm_null(Cast<WasmNull>(wasm_null_obj));
-  }
-#else
-  // Allocate the WasmNull.
-  {
-    Tagged<HeapObject> wasm_null_obj;
-    CHECK(AllocateRaw(WasmNull::kSize, AllocationType::kReadOnly)
-              .To(&wasm_null_obj));
-    wasm_null_obj->set_map_after_allocation(isolate(), roots.wasm_null_map(),
-                                            SKIP_WRITE_BARRIER);
-    set_wasm_null(Cast<WasmNull>(wasm_null_obj));
-  }
-#endif  // V8_UNMAP_WASM_NULL_PAYLOAD
-#endif  // V8_ENABLE_WEBASSEMBLY
-
-  auto make_hole = [this, roots, factory]() {
-    USE(factory);
-
-    static_assert(sizeof(Hole) == sizeof(Hole::map_) + Hole::kPayloadSize);
-    Tagged<HeapObject> hole_obj =
-        read_only_space_
-            ->AllocateRawUnmappableAllocation(sizeof(Hole::map_),
-                                              Hole::kPayloadSize)
-            .ToObjectChecked();
-    hole_obj->set_map_after_allocation(isolate(), roots.hole_map(),
-                                       SKIP_WRITE_BARRIER);
-    // No need to initialize the payload since it's either empty or unmapped.
-    return Cast<Hole>(hole_obj);
-  };
-
-  // Set up the hole values in one range
-  set_the_hole_value(UncheckedCast<TheHole>(make_hole()));
-
-  set_property_cell_hole_value(UncheckedCast<PropertyCellHole>(make_hole()));
-  set_hash_table_hole_value(UncheckedCast<HashTableHole>(make_hole()));
-  set_promise_hole_value(UncheckedCast<PromiseHole>(make_hole()));
-  set_uninitialized_value(UncheckedCast<UninitializedHole>(make_hole()));
-  set_arguments_marker(UncheckedCast<ArgumentsMarker>(make_hole()));
-  set_termination_exception(UncheckedCast<TerminationException>(make_hole()));
-  set_exception(UncheckedCast<ExceptionHole>(make_hole()));
-  set_optimized_out(UncheckedCast<OptimizedOut>(make_hole()));
-  set_stale_register(UncheckedCast<StaleRegister>(make_hole()));
-
-  // Initialize marker objects used during compilation.
-  set_self_reference_marker(UncheckedCast<SelfReferenceMarker>(make_hole()));
-  set_basic_block_counters_marker(
-      UncheckedCast<BasicBlockCountersMarker>(make_hole()));
 
   return true;
 }
