@@ -458,6 +458,8 @@ bool StartupData::CanBeRehashed() const {
 
 bool StartupData::IsValid() const { return i::Snapshot::VersionIsValid(this); }
 
+bool StartupData::IsFileBacked() const { return is_file_backed; }
+
 void V8::SetDcheckErrorHandler(DcheckErrorCallback that) {
   v8::base::SetDcheckFunction(that);
 }
@@ -10228,6 +10230,10 @@ void Isolate::Initialize(Isolate* v8_isolate,
   } else {
     i_isolate->set_snapshot_blob(i::Snapshot::DefaultSnapshotBlob());
   }
+  CHECK_IMPLIES(
+      i_isolate->snapshot_blob() != nullptr &&
+          i_isolate->snapshot_blob()->IsFileBacked(),
+      IsAlignedAddress(i_isolate->snapshot_blob()->data, i::CommitPageSize()));
 
   if (params.fatal_error_callback) {
     v8_isolate->SetFatalErrorHandler(params.fatal_error_callback);

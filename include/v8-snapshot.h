@@ -31,9 +31,15 @@ class V8_EXPORT StartupData {
    * V8 instance.
    */
   bool IsValid() const;
+  /**
+   * Whether the data is a mapping over a file. Used for more efficient
+   * copying via OS::RemapPages.
+   */
+  bool IsFileBacked() const;
 
   const char* data;
   int raw_size;
+  bool is_file_backed = false;
 };
 
 /**

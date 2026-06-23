@@ -16,6 +16,10 @@
 #include "src/flags/flags.h"
 #include "src/utils/utils.h"
 
+#if defined(V8_OS_LINUX)
+#include <sys/mman.h>
+#endif
+
 namespace v8 {
 namespace internal {
 
@@ -28,9 +32,20 @@ v8::StartupData g_snapshot;
 void ClearStartupData(v8::StartupData* data) {
   data->data = nullptr;
   data->raw_size = 0;
+  data->is_file_backed = false;
 }
 
 void DeleteStartupData(v8::StartupData* data) {
+#if defined(V8_OS_LINUX)
+  if (data->IsFileBacked()) {
+    if (data->data != nullptr) {
+      munmap(const_cast<char*>(data->data),
+             static_cast<size_t>(data->raw_size));
+    }
+    ClearStartupData(data);
+    return;
+  }
+#endif  // defined(V8_OS_LINUX)
   delete[] data->data;
   ClearStartupData(data);
 }
@@ -54,6 +69,19 @@ void Load(const char* blob_file, v8::StartupData* startup_data,
   fseek(file, 0, SEEK_END);
   startup_data->raw_size = static_cast<int>(ftell(file));
   rewind(file);
+
+#if defined(V8_OS_LINUX)
+  void* mapping = mmap(nullptr, static_cast<size_t>(startup_data->raw_size),
+                       PROT_READ, MAP_PRIVATE, fileno(file), 0);
+  if (mapping != MAP_FAILED) {
+    startup_data->data = reinterpret_cast<char*>(mapping);
+    startup_data->is_file_backed = true;
+    (*setter_fn)(startup_data);
+    base::Fclose(file);
+    return;
+  }
+  // Otherwise fall back to reading the bytes into a heap buffer below.
+#endif
 
   startup_data->data = new char[startup_data->raw_size];
   int read_size = static_cast<int>(fread(const_cast<char*>(startup_data->data),

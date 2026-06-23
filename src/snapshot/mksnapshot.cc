@@ -105,7 +105,7 @@ class SnapshotFileWriter {
     fprintf(fp, "};\n");
     fprintf(fp, "static const int blob_size = %d;\n", blob.length());
     fprintf(fp, "static const v8::StartupData blob =\n");
-    fprintf(fp, "{ (const char*) blob_data, blob_size };\n");
+    fprintf(fp, "{ (const char*) blob_data, blob_size, true };\n");
   }
 
   static void WriteBinaryContentsAsCArray(

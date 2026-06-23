@@ -182,6 +182,21 @@ class ReadOnlyHeapImageDeserializer final {
     // First page is at cage base.
     Address cage_base = pages.front()->ChunkAddress();
 
+#if V8_STATIC_ROOTS_BOOL && V8_ENABLE_SANDBOX
+    size_t page_size = CommitPageSize();
+    uint32_t blob_size = blob_offset_from_end;
+
+    bool try_remap = false;
+    const StartupData* snapshot_blob = isolate_->snapshot_blob();
+    if (base::OS::IsRemapPageSupported() && snapshot_blob &&
+        snapshot_blob->IsFileBacked()) {
+      const uint8_t* blob_data =
+          reinterpret_cast<const uint8_t*>(snapshot_blob->data);
+      try_remap = blob_data <= blob_start &&
+                  blob_start + blob_size <= blob_data + snapshot_blob->raw_size;
+    }
+#endif
+
     for (uint32_t k = 0; k < num_runs; ++k) {
       uint32_t dest_offset = source_->GetUint32();
       uint32_t data_offset = source_->GetUint32();
@@ -190,7 +205,19 @@ class ReadOnlyHeapImageDeserializer final {
       const uint8_t* src = blob_start + data_offset;
       Address dest = cage_base + dest_offset;
 
-      memcpy(reinterpret_cast<void*>(dest), src, length);
+      bool mapped = false;
+#if V8_STATIC_ROOTS_BOOL && V8_ENABLE_SANDBOX
+      if (try_remap && IsAlignedAddress(src, page_size) &&
+          IsAligned(dest, page_size)) {
+        mapped = base::OS::RemapPages(
+            src, RoundUp(static_cast<size_t>(length), page_size),
+            reinterpret_cast<void*>(dest),
+            base::OS::MemoryPermission::kReadWrite);
+      }
+#endif
+      if (!mapped) {
+        memcpy(reinterpret_cast<void*>(dest), src, length);
+      }
     }
   }
 
@@ -489,19 +516,32 @@ void ReadOnlyDeserializer::PostProcessNewObjects(
       trusted_pointer_entries;
 #endif  // V8_ENABLE_SANDBOX
 
-  // Without pointer compression, we need to iterate all RO objects to find
-  // InternalizedStrings for the string table. With pointer compression, we
+  // Without static roots, we need to iterate all RO objects to find
+  // InternalizedStrings for the string table. With static roots, we
   // only need to iterate all objects when rehashing.
-#ifdef V8_COMPRESS_POINTERS
-  constexpr bool kPopulateStringTable = false;
-#else
-  constexpr bool kPopulateStringTable = true;
-#endif
+  constexpr bool kPopulateStringTable = !V8_STATIC_ROOTS_BOOL;
 
   StringTable* string_table =
       kPopulateStringTable && isolate()->OwnsStringTables()
           ? isolate()->string_table()
           : nullptr;
+
+  auto post_process_object = [&](Tagged<HeapObject> o,
+                                 InstanceType instance_type) {
+    post_processor.PostProcessIfNeeded(o, instance_type);
+
+#ifdef V8_ENABLE_SANDBOX
+    if (IsExposedTrustedObject(o)) {
+      SharedFlag shared = SharedFlag(HeapLayout::InAnySharedSpace(o));
+      IndirectPointerTag tag =
+          IndirectPointerTagFromInstanceType(instance_type, shared);
+      Tagged<ExposedTrustedObject> exposed =
+          TrustedCast<ExposedTrustedObject>(o);
+      TrustedPointerHandle handle = exposed->self_indirect_pointer_handle();
+      trusted_pointer_entries.emplace_back(handle, exposed.ptr(), tag);
+    }
+#endif  // V8_ENABLE_SANDBOX
+  };
 
   if (kPopulateStringTable || should_rehash()) {
     // Full iteration over all RO heap objects.
@@ -523,24 +563,12 @@ void ReadOnlyDeserializer::PostProcessNewObjects(
       } else if (should_rehash() && o->NeedsRehashing(instance_type)) {
         PushObjectToRehash(direct_handle(o, isolate()));
       }
-      post_processor.PostProcessIfNeeded(o, instance_type);
-
-#ifdef V8_ENABLE_SANDBOX
-      if (IsExposedTrustedObject(o)) {
-        SharedFlag shared = SharedFlag(HeapLayout::InAnySharedSpace(o));
-        IndirectPointerTag tag =
-            IndirectPointerTagFromInstanceType(instance_type, shared);
-        Tagged<ExposedTrustedObject> exposed =
-            TrustedCast<ExposedTrustedObject>(o);
-        TrustedPointerHandle handle = exposed->self_indirect_pointer_handle();
-        trusted_pointer_entries.emplace_back(handle, exposed.ptr(), tag);
-      }
-#endif  // V8_ENABLE_SANDBOX
+      post_process_object(o, instance_type);
     }
   } else {
-    // Compressed pointers + no rehash: only iterate post-process ranges.
+    // Static roots + no rehash: only iterate post-process ranges.
     USE(string_table);
-#ifdef V8_COMPRESS_POINTERS
+#if V8_STATIC_ROOTS_BOOL
     ReadOnlySpace* ro_space = isolate()->read_only_heap()->read_only_space();
     for (const PostProcessRange& range : ranges) {
       const ReadOnlyPage* page = ro_space->pages()[range.page_index];
@@ -549,20 +577,7 @@ void ReadOnlyDeserializer::PostProcessNewObjects(
       ReadOnlyPageObjectIterator it(page, start);
       for (Tagged<HeapObject> o = it.Next(); !o.is_null(); o = it.Next()) {
         if (o.address() >= end) break;
-        const InstanceType instance_type = o->map()->instance_type();
-        post_processor.PostProcessIfNeeded(o, instance_type);
-
-#ifdef V8_ENABLE_SANDBOX
-        if (IsExposedTrustedObject(o)) {
-          SharedFlag shared = SharedFlag(HeapLayout::InAnySharedSpace(o));
-          IndirectPointerTag tag =
-              IndirectPointerTagFromInstanceType(instance_type, shared);
-          Tagged<ExposedTrustedObject> exposed =
-              TrustedCast<ExposedTrustedObject>(o);
-          TrustedPointerHandle handle = exposed->self_indirect_pointer_handle();
-          trusted_pointer_entries.emplace_back(handle, exposed.ptr(), tag);
-        }
-#endif  // V8_ENABLE_SANDBOX
+        post_process_object(o, o->map()->instance_type());
       }
     }
 #else

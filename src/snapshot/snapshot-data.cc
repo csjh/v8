@@ -48,7 +48,10 @@ SnapshotData::SnapshotData(const Serializer* serializer) {
 base::Vector<const uint8_t> SnapshotData::Payload() const {
   const uint8_t* payload = data_ + kHeaderSize;
   uint32_t length = GetHeaderValue(kPayloadLengthOffset);
-  DCHECK_EQ(data_ + size_, payload + length);
+  // size_ is the section span between blob offsets, which may include
+  // trailing page-alignment padding added by CreateSnapshotBlob. The
+  // payload only needs to fit within it.
+  DCHECK_LE(payload + length, data_ + size_);
   return base::Vector<const uint8_t>(payload, length);
 }
 

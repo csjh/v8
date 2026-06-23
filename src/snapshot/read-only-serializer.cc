@@ -660,7 +660,7 @@ class ReadOnlyHeapImageSerializer {
     }
   }
 
-#if V8_ENABLE_SANDBOX
+#if V8_STATIC_ROOTS_BOOL && V8_ENABLE_SANDBOX
   // Write the MemoryChunk header for a page in the blob and verify it
   // matches the live page's header.
   // The layout is: [MainThreadFlags (uintptr_t)] [metadata_index (uint32_t)]
@@ -710,11 +710,8 @@ class ReadOnlyHeapImageSerializer {
     // First page is at cage base (offset 0).
     Address cage_base = pages.front()->ChunkAddress();
     // Blob covers from the cage base to the last page's high water mark.
-    const ReadOnlyPage* last_page = pages.back();
-    size_t blob_size = (last_page->ChunkAddress() - cage_base) +
-                       (last_page->HighWaterMark() - last_page->ChunkAddress());
+    size_t blob_size = pages.back()->HighWaterMark() - cage_base;
 
-    // Allocate zero-initialized blob.
     std::vector<uint8_t> blob(blob_size, 0);
 
     size_t header_size =
@@ -772,7 +769,7 @@ class ReadOnlyHeapImageSerializer {
 
     return blob;
   }
-#endif  // V8_COMPRESS_POINTERS
+#endif  // V8_STATIC_ROOTS_BOOL && V8_ENABLE_SANDBOX
 
   void EmitReadOnlyRootsTable() {
     sink_->Put(Bytecode::kReadOnlyRootsTable, "read only roots table");
